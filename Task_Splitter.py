@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from docx import Document
+from docx.enum.section import WD_ORIENTATION
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
@@ -1024,12 +1025,13 @@ _DOCX_HEADERS = [
 _CHECKMARK = "✓"
 
 
-def build_shift_briefing_doc(
-    target_date: date,
-    labels: List[str],
-    buckets: Dict[str, List[TailPackage]],
-    priority_details: Dict[str, str],
-) -> bytes:
+def _apply_landscape(document: Document) -> None:
+    for section in document.sections:
+        section.orientation = WD_ORIENTATION.LANDSCAPE
+        section.page_width, section.page_height = section.page_height, section.page_width
+
+
+def _initialize_briefing_document(target_date: date) -> Document:
     document = Document()
     document.core_properties.title = f"{target_date} Shift Briefing"
     normal_style = document.styles["Normal"]
@@ -1038,80 +1040,122 @@ def build_shift_briefing_doc(
 
     title_para = document.add_paragraph(f"Daily Flight Sheet – {target_date}")
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title_para.runs[0].font.size = Pt(16)
-    title_para.runs[0].bold = True
+    if title_para.runs:
+        title_run = title_para.runs[0]
+    else:
+        title_run = title_para.add_run(f"Daily Flight Sheet – {target_date}")
+    title_run.font.size = Pt(16)
+    title_run.bold = True
 
-    for idx, label in enumerate(labels):
-        pkgs = buckets.get(label, [])
-        if idx > 0:
-            document.add_paragraph("")
+    _apply_landscape(document)
+    return document
 
-        table_rows = len(pkgs) + 3  # header row + column headers + data + footer
-        table = document.add_table(rows=table_rows, cols=len(_DOCX_HEADERS))
-        table.style = "Table Grid"
-        table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
-        # Shift label header row spanning all columns
-        top_cell = table.rows[0].cells[0]
-        for merge_idx in range(1, len(_DOCX_HEADERS)):
-            top_cell = top_cell.merge(table.rows[0].cells[merge_idx])
-        top_paragraph = top_cell.paragraphs[0]
-        top_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = top_paragraph.add_run(label)
-        run.bold = True
-        run.font.size = Pt(14)
+def _add_shift_table(
+    document: Document,
+    label: str,
+    pkgs: List[TailPackage],
+    priority_details: Dict[str, str],
+) -> None:
+    sorted_pkgs = sorted(pkgs, key=lambda p: (p.first_local_dt, p.tail))
+    table_rows = len(sorted_pkgs) + 3  # header row + column headers + data + footer
+    table = document.add_table(rows=table_rows, cols=len(_DOCX_HEADERS))
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
-        # Column headers
-        header_row = table.rows[1]
-        for col_idx, header_text in enumerate(_DOCX_HEADERS):
-            header_cell = header_row.cells[col_idx]
-            header_cell.text = header_text
-            header_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-            header_paragraph = header_cell.paragraphs[0]
-            header_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            header_paragraph.runs[0].font.bold = True
+    # Shift label header row spanning all columns
+    top_cell = table.rows[0].cells[0]
+    for merge_idx in range(1, len(_DOCX_HEADERS)):
+        top_cell = top_cell.merge(table.rows[0].cells[merge_idx])
+    top_paragraph = top_cell.paragraphs[0]
+    top_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = top_paragraph.add_run(label)
+    run.bold = True
+    run.font.size = Pt(14)
 
-        # Data rows
-        for row_offset, pkg in enumerate(sorted(pkgs, key=lambda p: (p.first_local_dt, p.tail))):
-            row = table.rows[row_offset + 2]
-            pic_name, sic_name = _crew_names_from_package(pkg)
-            values = [""] * len(_DOCX_HEADERS)
-            values[0] = pkg.tail
-            values[1] = pic_name
-            values[2] = sic_name
-            detail = priority_details.get(pkg.tail, "")
-            if detail and not detail.lower().startswith("priority"):
-                values[12] = detail
-            elif detail:
-                values[12] = detail.replace("priority", "", 1).strip() or detail
-            if pkg.has_priority:
-                values[13] = _CHECKMARK
-            for col_idx, value in enumerate(values):
-                cell = row.cells[col_idx]
-                cell.text = value
-                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-                if col_idx in {0, 13}:
-                    cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # Column headers
+    header_row = table.rows[1]
+    for col_idx, header_text in enumerate(_DOCX_HEADERS):
+        header_cell = header_row.cells[col_idx]
+        header_cell.text = header_text
+        header_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        header_paragraph = header_cell.paragraphs[0]
+        header_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        header_paragraph.runs[0].font.bold = True
 
-        # Footer row for positioning/notes
-        footer_row = table.rows[-1]
-        positioning_cell = footer_row.cells[0]
-        for merge_idx in range(1, max(1, len(_DOCX_HEADERS) // 2)):
-            positioning_cell = positioning_cell.merge(footer_row.cells[merge_idx])
-        positioning_cell.text = "POSITIONING:"
-        positioning_cell.paragraphs[0].runs[0].bold = True
+    # Data rows
+    for row_offset, pkg in enumerate(sorted_pkgs):
+        row = table.rows[row_offset + 2]
+        pic_name, sic_name = _crew_names_from_package(pkg)
+        values = [""] * len(_DOCX_HEADERS)
+        values[0] = pkg.tail
+        values[1] = pic_name
+        values[2] = sic_name
+        detail = priority_details.get(pkg.tail, "")
+        if detail and not detail.lower().startswith("priority"):
+            values[12] = detail
+        elif detail:
+            values[12] = detail.replace("priority", "", 1).strip() or detail
+        if pkg.has_priority:
+            values[13] = _CHECKMARK
+        for col_idx, value in enumerate(values):
+            cell = row.cells[col_idx]
+            cell.text = value
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            if col_idx in {0, 13}:
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        notes_start = len(_DOCX_HEADERS) // 2
-        notes_cell = footer_row.cells[notes_start]
-        for merge_idx in range(notes_start + 1, len(_DOCX_HEADERS)):
-            notes_cell = notes_cell.merge(footer_row.cells[merge_idx])
-        notes_cell.text = "ADDITIONAL NOTES:"
-        notes_cell.paragraphs[0].runs[0].bold = True
+    # Footer row for positioning/notes
+    footer_row = table.rows[-1]
+    positioning_cell = footer_row.cells[0]
+    for merge_idx in range(1, max(1, len(_DOCX_HEADERS) // 2)):
+        positioning_cell = positioning_cell.merge(footer_row.cells[merge_idx])
+    positioning_cell.text = "POSITIONING:"
+    positioning_cell.paragraphs[0].runs[0].bold = True
 
+    notes_start = len(_DOCX_HEADERS) // 2
+    notes_cell = footer_row.cells[notes_start]
+    for merge_idx in range(notes_start + 1, len(_DOCX_HEADERS)):
+        notes_cell = notes_cell.merge(footer_row.cells[merge_idx])
+    notes_cell.text = "ADDITIONAL NOTES:"
+    notes_cell.paragraphs[0].runs[0].bold = True
+
+
+def _document_to_bytes(document: Document) -> bytes:
     buffer = BytesIO()
     document.save(buffer)
     buffer.seek(0)
     return buffer.getvalue()
+
+
+def _label_slug(label: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", label.strip()).strip("_")
+    return slug or "shift"
+
+
+def build_shift_briefing_docs(
+    target_date: date,
+    labels: List[str],
+    buckets: Dict[str, List[TailPackage]],
+    priority_details: Dict[str, str],
+) -> tuple[bytes, Dict[str, bytes]]:
+    combined_document = _initialize_briefing_document(target_date)
+
+    for idx, label in enumerate(labels):
+        pkgs = buckets.get(label, [])
+        if idx > 0:
+            combined_document.add_paragraph("")
+        _add_shift_table(combined_document, label, pkgs, priority_details)
+
+    combined_payload = _document_to_bytes(combined_document)
+
+    per_shift_payloads: Dict[str, bytes] = {}
+    for label in labels:
+        shift_document = _initialize_briefing_document(target_date)
+        _add_shift_table(shift_document, label, buckets.get(label, []), priority_details)
+        per_shift_payloads[label] = _document_to_bytes(shift_document)
+
+    return combined_payload, per_shift_payloads
 
 
 # ----------------------------
@@ -1301,7 +1345,9 @@ if st.session_state.get("_run"):
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     # Downloads
-    doc_payload = build_shift_briefing_doc(selected_date, labels, buckets, priority_details)
+    doc_payload, per_shift_docs = build_shift_briefing_docs(
+        selected_date, labels, buckets, priority_details
+    )
     st.download_button(
         label="⬇️ Download daily flight sheet (DOCX)",
         data=doc_payload,
@@ -1309,6 +1355,23 @@ if st.session_state.get("_run"):
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         use_container_width=True,
     )
+
+    if per_shift_docs:
+        st.markdown("#### Individual shift documents")
+        columns = st.columns(min(3, len(per_shift_docs)) or 1)
+        for idx, label in enumerate(labels):
+            payload = per_shift_docs.get(label)
+            if not payload:
+                continue
+            column = columns[idx % len(columns)]
+            with column:
+                st.download_button(
+                    label=f"⬇️ {label}",
+                    data=payload,
+                    file_name=f"daily_flight_sheet_{selected_date}_{_label_slug(label)}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
     st.download_button(
         label="⬇️ Download assignments (CSV)",
         data=combined_df.to_csv(index=False).encode("utf-8"),
