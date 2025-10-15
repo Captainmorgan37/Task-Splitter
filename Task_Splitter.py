@@ -1,4 +1,3 @@
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date, time, timezone
@@ -1265,19 +1264,6 @@ fetch_crew = st.sidebar.toggle(
     disabled=use_stub,
 )
 
-assign_mode = st.sidebar.radio(
-    "Assignment mode",
-    [
-        "Round-robin by first local departure",
-        "Balanced by legs (bin-pack)",
-        "Preference-weighted east→west",
-    ],
-    help=(
-        "Preference weighting leans earlier shifts toward eastern departures and later shifts toward western ones "
-        "while still keeping leg counts even."
-    ),
-)
-
 num_people = st.sidebar.number_input("Number of on-duty people", min_value=1, max_value=12, value=4, step=1)
 
 default_labels = _default_shift_labels(int(num_people))
@@ -1307,7 +1293,6 @@ with col2:
         "**Settings:**",
         {
             "date": str(selected_date),
-            "mode": assign_mode,
             "labels": labels,
         }
     )
@@ -1316,7 +1301,7 @@ with col2:
 # Processing & Output
 # ----------------------------
 if st.session_state.get("_run"):
-    legs_df, fetch_metadata, crew_summary = fetch_next_day_legs(
+    legs_df, _, crew_summary = fetch_next_day_legs(
         selected_date,
         use_stub=use_stub,
         fl3xx_settings=fl3xx_cfg if not use_stub else None,
@@ -1326,13 +1311,6 @@ if st.session_state.get("_run"):
     if legs_df.empty:
         st.warning("No legs returned for the selected date.")
         st.stop()
-
-    with st.expander("Raw legs (preview)", expanded=False):
-        st.dataframe(legs_df, use_container_width=True)
-
-    if fetch_metadata:
-        with st.expander("FL3XX fetch metadata", expanded=False):
-            st.json(fetch_metadata)
 
     if crew_summary and crew_summary.get("fetched"):
         st.sidebar.metric("Crew lookups", int(crew_summary["fetched"]))
@@ -1369,12 +1347,7 @@ if st.session_state.get("_run"):
 
     st.subheader("Assignments")
 
-    if assign_mode.startswith("Round-robin"):
-        buckets = assign_round_robin_by_first(packages, labels)
-    elif assign_mode.startswith("Balanced"):
-        buckets = assign_balanced_by_legs(packages, labels)
-    else:
-        buckets = assign_preference_weighted(packages, labels)
+    buckets = assign_preference_weighted(packages, labels)
 
     # Display per-shift tables
     tabs = st.tabs(labels)
@@ -1446,36 +1419,5 @@ if st.session_state.get("_run"):
         use_container_width=True,
     )
 
-    # JSON mapping for integrations
-    mapping = {lab: [p.tail for p in buckets.get(lab, [])] for lab in labels}
-    payload = {
-        "date": str(selected_date),
-        "mode": assign_mode,
-        "mapping": mapping,
-    }
-    if priority_tails:
-        payload["priority_tails"] = priority_tails
-        payload["priority_details"] = {
-            tail: priority_details[tail] or "Priority"
-            for tail in priority_tails
-        }
-    st.code(json.dumps(payload, indent=2))
+    st.success("Done. Adjust inputs and re-run as needed.")
 
-    st.success("Done. Adjust labels or mode and re-run as needed.")
-
-# ----------------------------
-# Notes / How-To
-# ----------------------------
-st.markdown(
-    """
----
-### How to wire your real API
-1. Store your FL3XX credentials inside `.streamlit/secrets.toml` under `[fl3xx_api]` to auto-populate the sidebar inputs.
-2. If your payload structure differs, tweak `_normalize_fl3xx_payload` so each row exposes `tail`, `leg_id`, `dep_time`, and optionally `dep_tz`.
-3. If your API only has departure airport (e.g., `dep_apt`), add a lookup to map airport → IANA tz and set `dep_tz` before calling `build_tail_packages`.
-4. The *round-robin* mode sorts packages by the first local departure time per tail and distributes in sequence.
-5. The *balanced* mode packs by legs to minimize spread.
-
-> You can easily add manual overrides later: a multiselect per shift for \"locked\" tails and re-run the solver for the rest.
-"""
-)
