@@ -1271,12 +1271,17 @@ def _add_shift_table(
         values[1] = pic_name
         values[2] = sic_name
         detail = priority_details.get(pkg.tail, "")
+        cleaned_detail = ""
         if detail and not detail.lower().startswith("priority"):
-            values[12] = detail
+            cleaned_detail = detail
         elif detail:
-            values[12] = detail.replace("priority", "", 1).strip() or detail
+            cleaned_detail = detail.replace("priority", "", 1).strip() or detail
         if pkg.has_priority:
             values[13] = _CHECKMARK
+            if cleaned_detail:
+                values[13] = f"{values[13]} {cleaned_detail}".strip()
+        elif cleaned_detail:
+            values[13] = cleaned_detail
         for col_idx, value in enumerate(values):
             cell = row.cells[col_idx]
             cell.text = value
