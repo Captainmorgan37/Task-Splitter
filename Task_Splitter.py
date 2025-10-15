@@ -1036,7 +1036,7 @@ def _initialize_briefing_document(target_date: date) -> Document:
     document.core_properties.title = f"{target_date} Shift Briefing"
     normal_style = document.styles["Normal"]
     normal_style.font.name = "Calibri"
-    normal_style.font.size = Pt(11)
+    normal_style.font.size = Pt(8)
 
     title_para = document.add_paragraph(f"Daily Flight Sheet – {target_date}")
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
