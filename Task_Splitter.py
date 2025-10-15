@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date, time, timezone
 from functools import lru_cache
+from io import BytesIO
 from pathlib import Path
 from collections.abc import Mapping
 from typing import List, Dict, Any, Tuple, Optional, Set
@@ -11,6 +12,11 @@ import pandas as pd
 import pytz
 from zoneinfo import ZoneInfo
 import streamlit as st
+
+from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt
 
 from fl3xx_api import (
     DEFAULT_FL3XX_BASE_URL,
@@ -88,6 +94,108 @@ def _priority_label(value: Any) -> Optional[str]:
     if "priority" in text.lower():
         return text
     return None
+
+
+def _normalize_person_name(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    return text
+
+
+def _member_display_name(member: Mapping[str, Any]) -> str:
+    candidates = [
+        member.get(key)
+        for key in (
+            "displayName",
+            "display_name",
+            "name",
+            "fullName",
+            "full_name",
+        )
+        if isinstance(member, Mapping)
+    ]
+    for candidate in candidates:
+        name = _normalize_person_name(candidate)
+        if name:
+            return name
+    if isinstance(member, Mapping):
+        first = _normalize_person_name(
+            member.get("firstName") or member.get("first_name")
+        )
+        last = _normalize_person_name(
+            member.get("lastName") or member.get("last_name")
+        )
+        combined = " ".join(part for part in (first, last) if part)
+        if combined.strip():
+            return combined.strip()
+    return ""
+
+
+_PIC_KEYWORDS = {
+    "pic",
+    "picname",
+    "captain",
+    "pilotincommand",
+    "pilot_in_command",
+    "pilotcommand",
+}
+
+_SIC_KEYWORDS = {
+    "sic",
+    "sicname",
+    "copilot",
+    "firstofficer",
+    "first_officer",
+}
+
+
+def _crew_names_from_row(row: Mapping[str, Any]) -> Tuple[str, str]:
+    pic = ""
+    sic = ""
+    for key, value in row.items():
+        if value is None:
+            continue
+        normalized_key = re.sub(r"[^a-z]", "", str(key).lower())
+        if not normalized_key:
+            continue
+        name = _normalize_person_name(value)
+        if not name:
+            continue
+        if not pic and normalized_key in _PIC_KEYWORDS:
+            pic = name
+        elif not sic and normalized_key in _SIC_KEYWORDS:
+            sic = name
+    crew_members = row.get("crewMembers")
+    if isinstance(crew_members, list):
+        for member in crew_members:
+            if not isinstance(member, Mapping):
+                continue
+            role = str(member.get("role") or member.get("position") or "").lower()
+            is_pic = bool(member.get("isPIC") or "pic" in role)
+            is_sic = bool(member.get("isSIC") or "sic" in role or "first officer" in role)
+            name = _member_display_name(member)
+            if name:
+                if not pic and is_pic:
+                    pic = name
+                elif not sic and is_sic:
+                    sic = name
+    return pic, sic
+
+
+def _crew_names_from_package(pkg: "TailPackage") -> Tuple[str, str]:
+    pic = ""
+    sic = ""
+    for leg in pkg.sample_legs:
+        if isinstance(leg, Mapping):
+            leg_pic, leg_sic = _crew_names_from_row(leg)
+            if not pic and leg_pic:
+                pic = leg_pic
+            if not sic and leg_sic:
+                sic = leg_sic
+            if pic and sic:
+                break
+    return pic, sic
 
 
 _TAIL_PLACEHOLDER_PREFIXES = ("ADD", "NEW", "TBD", "TEMP", "HOLD", "UNKNOWN", "UNK")
@@ -896,6 +1004,116 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+_DOCX_HEADERS = [
+    "TAIL #",
+    "CREW PIC",
+    "CREW SIC",
+    "FUEL",
+    "CUSTOMS",
+    "SLOT / PPR",
+    "FLIGHT PLANS",
+    "CREW BRIEF",
+    "CONFIRMATION PIC",
+    "CONFIRMATION SIC",
+    "CHECK LIST",
+    "RELEASE",
+    "NOTES",
+    "Priority Status",
+]
+
+_CHECKMARK = "✓"
+
+
+def build_shift_briefing_doc(
+    target_date: date,
+    labels: List[str],
+    buckets: Dict[str, List[TailPackage]],
+    priority_details: Dict[str, str],
+) -> bytes:
+    document = Document()
+    document.core_properties.title = f"{target_date} Shift Briefing"
+    normal_style = document.styles["Normal"]
+    normal_style.font.name = "Calibri"
+    normal_style.font.size = Pt(11)
+
+    title_para = document.add_paragraph(f"Daily Flight Sheet – {target_date}")
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_para.runs[0].font.size = Pt(16)
+    title_para.runs[0].bold = True
+
+    for idx, label in enumerate(labels):
+        pkgs = buckets.get(label, [])
+        if idx > 0:
+            document.add_paragraph("")
+
+        table_rows = len(pkgs) + 3  # header row + column headers + data + footer
+        table = document.add_table(rows=table_rows, cols=len(_DOCX_HEADERS))
+        table.style = "Table Grid"
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        # Shift label header row spanning all columns
+        top_cell = table.rows[0].cells[0]
+        for merge_idx in range(1, len(_DOCX_HEADERS)):
+            top_cell = top_cell.merge(table.rows[0].cells[merge_idx])
+        top_paragraph = top_cell.paragraphs[0]
+        top_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = top_paragraph.add_run(label)
+        run.bold = True
+        run.font.size = Pt(14)
+
+        # Column headers
+        header_row = table.rows[1]
+        for col_idx, header_text in enumerate(_DOCX_HEADERS):
+            header_cell = header_row.cells[col_idx]
+            header_cell.text = header_text
+            header_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            header_paragraph = header_cell.paragraphs[0]
+            header_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            header_paragraph.runs[0].font.bold = True
+
+        # Data rows
+        for row_offset, pkg in enumerate(sorted(pkgs, key=lambda p: (p.first_local_dt, p.tail))):
+            row = table.rows[row_offset + 2]
+            pic_name, sic_name = _crew_names_from_package(pkg)
+            values = [""] * len(_DOCX_HEADERS)
+            values[0] = pkg.tail
+            values[1] = pic_name
+            values[2] = sic_name
+            detail = priority_details.get(pkg.tail, "")
+            if detail and not detail.lower().startswith("priority"):
+                values[12] = detail
+            elif detail:
+                values[12] = detail.replace("priority", "", 1).strip() or detail
+            if pkg.has_priority:
+                values[13] = _CHECKMARK
+            for col_idx, value in enumerate(values):
+                cell = row.cells[col_idx]
+                cell.text = value
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                if col_idx in {0, 13}:
+                    cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # Footer row for positioning/notes
+        footer_row = table.rows[-1]
+        positioning_cell = footer_row.cells[0]
+        for merge_idx in range(1, max(1, len(_DOCX_HEADERS) // 2)):
+            positioning_cell = positioning_cell.merge(footer_row.cells[merge_idx])
+        positioning_cell.text = "POSITIONING:"
+        positioning_cell.paragraphs[0].runs[0].bold = True
+
+        notes_start = len(_DOCX_HEADERS) // 2
+        notes_cell = footer_row.cells[notes_start]
+        for merge_idx in range(notes_start + 1, len(_DOCX_HEADERS)):
+            notes_cell = notes_cell.merge(footer_row.cells[merge_idx])
+        notes_cell.text = "ADDITIONAL NOTES:"
+        notes_cell.paragraphs[0].runs[0].bold = True
+
+    buffer = BytesIO()
+    document.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # ----------------------------
 # Sidebar: Inputs
 # ----------------------------
@@ -1083,6 +1301,14 @@ if st.session_state.get("_run"):
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     # Downloads
+    doc_payload = build_shift_briefing_doc(selected_date, labels, buckets, priority_details)
+    st.download_button(
+        label="⬇️ Download daily flight sheet (DOCX)",
+        data=doc_payload,
+        file_name=f"daily_flight_sheet_{selected_date}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
+    )
     st.download_button(
         label="⬇️ Download assignments (CSV)",
         data=combined_df.to_csv(index=False).encode("utf-8"),
