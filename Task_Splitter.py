@@ -185,6 +185,48 @@ def assign_balanced_by_legs(packages: List[TailPackage], labels: List[str]) -> D
     return buckets
 
 
+def _offset_hours(dt: datetime) -> float:
+    offset = dt.utcoffset()
+    if offset is None:
+        return 0.0
+    return offset.total_seconds() / 3600
+
+
+def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -> Dict[str, List[TailPackage]]:
+    if not packages or not labels:
+        return {lab: [] for lab in labels}
+
+    offsets = [_offset_hours(pkg.first_local_dt) for pkg in packages]
+    min_off, max_off = min(offsets), max(offsets)
+    if len(labels) == 1:
+        targets = [min_off]
+    elif max_off == min_off:
+        targets = [min_off for _ in labels]
+    else:
+        targets = [min_off + (max_off - min_off) * (idx / (len(labels) - 1)) for idx in range(len(labels))]
+
+    buckets: Dict[str, List[TailPackage]] = {lab: [] for lab in labels}
+    totals = {lab: 0 for lab in labels}
+
+    for pkg in sorted(packages, key=lambda p: p.first_local_dt):
+        pkg_offset = _offset_hours(pkg.first_local_dt)
+
+        def score(lab: str) -> tuple[float, int, int]:
+            target = targets[labels.index(lab)]
+            tz_penalty = abs(pkg_offset - target)
+            return (
+                round(tz_penalty, 4),
+                totals[lab] + pkg.legs,
+                len(buckets[lab]),
+            )
+
+        label = min(labels, key=score)
+        buckets[label].append(pkg)
+        totals[label] += pkg.legs
+
+    return buckets
+
+
 def buckets_to_df(buckets: Dict[str, List[TailPackage]]) -> pd.DataFrame:
     rows = []
     for label, pkgs in buckets.items():
@@ -223,7 +265,15 @@ api_token = st.sidebar.text_input("API Token (optional)", type="password")
 
 assign_mode = st.sidebar.radio(
     "Assignment mode",
-    ["Round-robin by first local departure", "Balanced by legs (bin-pack)"]
+    [
+        "Round-robin by first local departure",
+        "Balanced by legs (bin-pack)",
+        "Preference-weighted east→west",
+    ],
+    help=(
+        "Preference weighting leans earlier shifts toward eastern departures and later shifts toward western ones "
+        "while still keeping leg counts even."
+    ),
 )
 
 num_people = st.sidebar.number_input("Number of on-duty people", min_value=1, max_value=12, value=4, step=1)
@@ -280,8 +330,10 @@ if st.session_state.get("_run"):
 
     if assign_mode.startswith("Round-robin"):
         buckets = assign_round_robin_by_first(packages, labels)
-    else:
+    elif assign_mode.startswith("Balanced"):
         buckets = assign_balanced_by_legs(packages, labels)
+    else:
+        buckets = assign_preference_weighted(packages, labels)
 
     # Display per-shift tables
     tabs = st.tabs(labels)
