@@ -87,6 +87,36 @@ def _priority_label(value: Any) -> Optional[str]:
     return None
 
 
+_TAIL_PLACEHOLDER_PREFIXES = ("ADD", "NEW", "TBD", "TEMP", "HOLD", "UNKNOWN", "UNK")
+_TAIL_PLACEHOLDER_VALUES = {"", "NA", "N/A", "NONE", "NULL", "-"}
+_TAIL_US_PATTERN = re.compile(r"^N[0-9]{1,5}[A-Z]{0,2}$")
+_TAIL_HYPHEN_PATTERN = re.compile(r"^[A-Z0-9]{1,2}-[A-Z0-9]{2,5}$")
+_TAIL_ALNUM_PATTERN = re.compile(r"^[A-Z0-9]{4,7}$")
+
+
+def _is_valid_tail_registration(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip().upper()
+    if not candidate or candidate in _TAIL_PLACEHOLDER_VALUES:
+        return False
+    if any(ch.isspace() for ch in candidate):
+        return False
+    if candidate.startswith(_TAIL_PLACEHOLDER_PREFIXES):
+        return False
+    if len(candidate) < 3:
+        return False
+    if _TAIL_US_PATTERN.fullmatch(candidate):
+        return True
+    if _TAIL_HYPHEN_PATTERN.fullmatch(candidate):
+        return True
+    if "-" not in candidate and not any(ch.isdigit() for ch in candidate):
+        return False
+    if _TAIL_ALNUM_PATTERN.fullmatch(candidate):
+        return True
+    return False
+
+
 def _tomorrow_local() -> date:
     now_local = datetime.now(LOCAL_TZ)
     return (now_local + timedelta(days=1)).date()
@@ -600,14 +630,30 @@ def _normalize_fl3xx_payload(payload: Any) -> Tuple[List[Dict[str, Any]], Dict[s
     return normalized, stats
 
 
-def build_tail_packages(df: pd.DataFrame, target_date: date) -> List[TailPackage]:
+def build_tail_packages(df: pd.DataFrame, target_date: date) -> Tuple[List[TailPackage], Set[str]]:
     if df.empty:
-        return []
+        return [], set()
     # Ensure required columns
     required = {"tail", "leg_id", "dep_time"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns in data: {missing}")
+
+    df = df.copy()
+    df["tail"] = df["tail"].astype(str)
+
+    invalid_tails: Set[str] = set()
+
+    def _valid_tail(value: Any) -> bool:
+        tail_str = str(value)
+        is_valid = _is_valid_tail_registration(tail_str)
+        if not is_valid:
+            invalid_tails.add(tail_str.strip())
+        return is_valid
+
+    df = df[df["tail"].map(_valid_tail)]
+    if df.empty:
+        return [], invalid_tails
 
     # Derive local first departure per tail for the day
     def first_local_for_tail(g: pd.DataFrame) -> datetime:
@@ -658,7 +704,7 @@ def build_tail_packages(df: pd.DataFrame, target_date: date) -> List[TailPackage
                 priority_labels=sorted(priority_values),
             )
         )
-    return packages
+    return packages, invalid_tails
 
 
 def assign_round_robin_by_first(packages: List[TailPackage], labels: List[str]) -> Dict[str, List[TailPackage]]:
@@ -699,11 +745,12 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
     avg_legs = total_legs / len(labels)
     tolerance = max(1, int(round(avg_legs * 0.4))) if avg_legs else 1
     if len(labels) == 1:
-        targets = [min_off]
+        targets = [max_off]
     elif max_off == min_off:
-        targets = [min_off for _ in labels]
+        targets = [max_off for _ in labels]
     else:
-        targets = [min_off + (max_off - min_off) * (idx / (len(labels) - 1)) for idx in range(len(labels))]
+        step = (max_off - min_off) / (len(labels) - 1)
+        targets = [max_off - step * idx for idx in range(len(labels))]
 
     buckets: Dict[str, List[TailPackage]] = {lab: [] for lab in labels}
     totals = {lab: 0 for lab in labels}
@@ -875,7 +922,22 @@ if st.session_state.get("_run"):
         if crew_summary.get("errors"):
             st.sidebar.warning(f"Crew errors: {len(crew_summary['errors'])}")
 
-    packages = build_tail_packages(legs_df, selected_date)
+    packages, invalid_tails = build_tail_packages(legs_df, selected_date)
+
+    if invalid_tails:
+        ignored = sorted(t for t in invalid_tails if t)
+        if ignored:
+            preview = ", ".join(ignored[:6])
+            if len(ignored) > 6:
+                preview += ", ..."
+            st.info(
+                "Ignored %d tail%s without an official registration: %s"
+                % (
+                    len(ignored),
+                    "s" if len(ignored) != 1 else "",
+                    preview,
+                )
+            )
 
     if not packages:
         st.info("No tail packages found for the selected date.")
