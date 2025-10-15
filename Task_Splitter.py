@@ -129,7 +129,7 @@ def _default_target_date() -> date:
 def _default_shift_labels(count: int) -> List[str]:
     presets: Dict[int, List[str]] = {
         3: ["0500", "0800", "1200"],
-        4: ["0500", "0600", "0700", "1200"],
+        4: ["0500", "0600", "0800", "1200"],
         5: ["0500", "0600", "0800", "0900", "1200"],
     }
     if count in presets:
