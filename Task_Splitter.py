@@ -5,7 +5,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Mapping
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Dict, Any, Tuple, Optional, Set, Sequence
 
 import pandas as pd
 import pytz
@@ -48,15 +48,38 @@ DEPARTURE_WINDOW_END_UTC = time(hour=8, tzinfo=UTC)
 class TailPackage:
     tail: str
     legs: int
+    workload: float
     first_local_dt: datetime  # first dep local datetime for the day
     sample_legs: List[Dict[str, Any]]  # optional preview rows for UI (subset)
     has_priority: bool = False
     priority_labels: List[str] = field(default_factory=list)
+    customs_legs: int = 0
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
+_CUSTOMS_WORKLOAD_MULTIPLIER = 1.5
+
+_DEPARTURE_AIRPORT_COLUMNS: Sequence[str] = (
+    "departure_airport",
+    "dep_airport",
+    "departureAirport",
+    "departure_airport_code",
+    "airportFrom",
+    "fromAirport",
+)
+
+_ARRIVAL_AIRPORT_COLUMNS: Sequence[str] = (
+    "arrival_airport",
+    "arr_airport",
+    "arrivalAirport",
+    "arrival_airport_code",
+    "airportTo",
+    "toAirport",
+)
+
+
 def _safe_parse_dt(dt_str: str) -> datetime:
     """Parse ISO-like datetime. If timezone-naive, assume UTC."""
     try:
@@ -333,6 +356,18 @@ def _airport_tz_path() -> Path:
 
 @lru_cache(maxsize=1)
 def _load_airport_tz_lookup() -> Dict[str, str]:
+    metadata = _load_airport_metadata_lookup()
+    tz_lookup: Dict[str, str] = {}
+    for code, record in metadata.items():
+        if isinstance(record, Mapping):
+            tz_value = record.get("tz")
+            if isinstance(tz_value, str) and tz_value:
+                tz_lookup[code] = tz_value
+    return tz_lookup
+
+
+@lru_cache(maxsize=1)
+def _load_airport_metadata_lookup() -> Dict[str, Dict[str, Optional[str]]]:
     path = _airport_tz_path()
     if not path.exists():
         return {}
@@ -341,18 +376,27 @@ def _load_airport_tz_lookup() -> Dict[str, str]:
     except Exception:
         return {}
 
-    lookup: Dict[str, str] = {}
+    lookup: Dict[str, Dict[str, Optional[str]]] = {}
     for _, row in df.iterrows():
+        tz: Optional[str] = None
         tz_value = row.get("tz")
-        if not isinstance(tz_value, str):
-            continue
-        tz = tz_value.strip()
-        if not tz:
+        if isinstance(tz_value, str) and tz_value.strip():
+            tz = tz_value.strip()
+
+        country: Optional[str] = None
+        country_value = row.get("country")
+        if isinstance(country_value, str) and country_value.strip():
+            country = country_value.strip()
+
+        if tz is None and country is None:
             continue
         for key in ("icao", "iata", "lid"):
             code_value = row.get(key)
             if isinstance(code_value, str) and code_value.strip():
-                lookup[code_value.strip().upper()] = tz
+                lookup[code_value.strip().upper()] = {
+                    "tz": tz,
+                    "country": country,
+                }
     return lookup
 
 
@@ -368,6 +412,37 @@ def _extract_codes(value: Any) -> List[str]:
     return [token.upper() for token in re.findall(r"\b[A-Za-z0-9]{3,4}\b", upper)]
 
 
+def _airport_country_from_row(
+    row: Mapping[str, Any],
+    columns: Sequence[str],
+    lookup: Dict[str, Dict[str, Optional[str]]],
+) -> Optional[str]:
+    for column in columns:
+        value = row.get(column)
+        if value is None:
+            continue
+        if isinstance(value, float) and pd.isna(value):
+            continue
+        for code in _extract_codes(str(value)):
+            record = lookup.get(code)
+            if not record:
+                continue
+            country = record.get("country") if isinstance(record, Mapping) else None
+            if isinstance(country, str) and country.strip():
+                return country.strip()
+    return None
+
+
+def _is_customs_leg(row: Mapping[str, Any], lookup: Dict[str, Dict[str, Optional[str]]]) -> bool:
+    if not lookup:
+        return False
+    dep_country = _airport_country_from_row(row, _DEPARTURE_AIRPORT_COLUMNS, lookup)
+    arr_country = _airport_country_from_row(row, _ARRIVAL_AIRPORT_COLUMNS, lookup)
+    if dep_country and arr_country:
+        return dep_country != arr_country
+    return False
+
+
 def _apply_airport_timezones(df: pd.DataFrame) -> Tuple[pd.DataFrame, Set[str], bool]:
     if df.empty:
         return df, set(), False
@@ -378,12 +453,6 @@ def _apply_airport_timezones(df: pd.DataFrame) -> Tuple[pd.DataFrame, Set[str], 
     lookup_used = bool(lookup)
 
     missing: Set[str] = set()
-    candidate_columns = [
-        "dep_airport",
-        "departure_airport",
-        "departureAirport",
-        "departure_airport_code",
-    ]
 
     def _needs_timezone(val: Any) -> bool:
         if val is None:
@@ -398,7 +467,7 @@ def _apply_airport_timezones(df: pd.DataFrame) -> Tuple[pd.DataFrame, Set[str], 
         if not _needs_timezone(row.get("dep_tz")):
             continue
         airport_value: Optional[str] = None
-        for col in candidate_columns:
+        for col in _DEPARTURE_AIRPORT_COLUMNS:
             if col in df.columns and not pd.isna(row.get(col)):
                 airport_value = str(row[col])
                 if airport_value:
@@ -919,6 +988,8 @@ def build_tail_packages(df: pd.DataFrame, target_date: date) -> Tuple[List[TailP
                 times_local.append(_to_local(dt, tz_name))
         return min(times_local)
 
+    airport_lookup = _load_airport_metadata_lookup()
+
     packages: List[TailPackage] = []
     for tail, g in df.groupby("tail", sort=False):
         # Limit to target_date legs (by local date)
@@ -927,6 +998,8 @@ def build_tail_packages(df: pd.DataFrame, target_date: date) -> Tuple[List[TailP
         priority_values: Set[str] = set()
         for _, row in g.iterrows():
             row_dict = row.to_dict()
+            is_customs = _is_customs_leg(row_dict, airport_lookup)
+            row_dict["is_customs_leg"] = is_customs
             all_rows.append(row_dict)
             priority_label = _priority_label(row_dict.get("workflowCustomName"))
             if priority_label:
@@ -940,14 +1013,20 @@ def build_tail_packages(df: pd.DataFrame, target_date: date) -> Tuple[List[TailP
         if not legs_rows:
             legs_rows = all_rows
         first_dt = first_local_for_tail(pd.DataFrame(legs_rows))
+        customs_count = sum(1 for leg in legs_rows if leg.get("is_customs_leg"))
+        workload = 0.0
+        for leg in legs_rows:
+            workload += _CUSTOMS_WORKLOAD_MULTIPLIER if leg.get("is_customs_leg") else 1.0
         packages.append(
             TailPackage(
                 tail=str(tail),
                 legs=len(legs_rows),
+                workload=workload,
                 first_local_dt=first_dt,
                 sample_legs=legs_rows[:3],
                 has_priority=bool(priority_values),
                 priority_labels=sorted(priority_values),
+                customs_legs=customs_count,
             )
         )
     return packages, invalid_tails
@@ -965,12 +1044,19 @@ def assign_round_robin_by_first(packages: List[TailPackage], labels: List[str]) 
 def assign_balanced_by_legs(packages: List[TailPackage], labels: List[str]) -> Dict[str, List[TailPackage]]:
     # Greedy bin-pack: biggest packages first → assign to bucket with lowest total legs
     buckets: Dict[str, List[TailPackage]] = {lab: [] for lab in labels}
-    totals = {lab: 0 for lab in labels}
-    for pkg in sorted(packages, key=lambda p: p.legs, reverse=True):
+    totals = {lab: 0.0 for lab in labels}
+
+    def _workload(pkg: TailPackage) -> float:
+        return pkg.workload if pkg.workload else float(pkg.legs)
+
+    for pkg in sorted(packages, key=lambda p: _workload(p), reverse=True):
         # choose label with smallest total, then smallest count, then order
-        label = sorted(labels, key=lambda lab: (totals[lab], len(buckets[lab]), labels.index(lab)))[0]
+        label = sorted(
+            labels,
+            key=lambda lab: (totals[lab], len(buckets[lab]), labels.index(lab)),
+        )[0]
         buckets[label].append(pkg)
-        totals[label] += pkg.legs
+        totals[label] += _workload(pkg)
     return buckets
 
 
@@ -987,11 +1073,14 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
 
     offsets = [_offset_hours(pkg.first_local_dt) for pkg in packages]
     min_off, max_off = min(offsets), max(offsets)
-    total_legs = sum(pkg.legs for pkg in packages)
-    avg_legs = total_legs / len(labels)
+    def _workload(pkg: TailPackage) -> float:
+        return pkg.workload if pkg.workload else float(pkg.legs)
+
+    total_workload = sum(_workload(pkg) for pkg in packages)
+    avg_workload = total_workload / len(labels) if labels else 0.0
     # Keep a small tolerance so we still respect the east↔west preference, but
     # not at the expense of an even split.
-    tolerance = max(1, int(round(avg_legs * 0.25))) if avg_legs else 1
+    tolerance = max(0.5, round(avg_workload * 0.25, 2)) if avg_workload else 0.5
     if len(labels) == 1:
         targets = [max_off]
     elif max_off == min_off:
@@ -1001,7 +1090,7 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
         targets = [max_off - step * idx for idx in range(len(labels))]
 
     buckets: Dict[str, List[TailPackage]] = {lab: [] for lab in labels}
-    totals = {lab: 0 for lab in labels}
+    totals = {lab: 0.0 for lab in labels}
 
     span = max_off - min_off
     center = min_off + span / 2 if span else min_off
@@ -1025,9 +1114,10 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
             else:
                 weight = 1.0
             tz_penalty = abs(pkg_offset - target) * weight
+            projected_total = totals[lab] + _workload(pkg)
             return (
-                round(abs((totals[lab] + pkg.legs) - avg_legs), 4),
-                round((totals[lab] + pkg.legs) - min_total, 4),
+                round(abs(projected_total - avg_workload), 4),
+                round(projected_total - min_total, 4),
                 round(tz_penalty, 4),
                 len(buckets[lab]),
                 labels.index(lab),
@@ -1035,7 +1125,7 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
 
         label = min(eligible_labels, key=score)
         buckets[label].append(pkg)
-        totals[label] += pkg.legs
+        totals[label] += _workload(pkg)
 
     return buckets
 
@@ -1048,6 +1138,8 @@ def buckets_to_df(buckets: Dict[str, List[TailPackage]]) -> pd.DataFrame:
                 "Shift": label,
                 "Tail": pkg.tail,
                 "Legs": pkg.legs,
+                "Customs Legs": pkg.customs_legs,
+                "Workload": round(pkg.workload, 2),
                 "First Local Dep": pkg.first_local_dt.strftime("%Y-%m-%d %H:%M %Z"),
                 "Priority Flight": "Yes" if pkg.has_priority else "No",
                 "Priority Detail": ", ".join(pkg.priority_labels) if pkg.priority_labels else "",
@@ -1061,12 +1153,22 @@ def buckets_to_df(buckets: Dict[str, List[TailPackage]]) -> pd.DataFrame:
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    agg = df.groupby("Shift").agg(Tails=("Tail", "count"), Legs=("Legs", "sum")).reset_index()
+    agg = (
+        df.groupby("Shift")
+        .agg(
+            Tails=("Tail", "count"),
+            Legs=("Legs", "sum"),
+            Customs=("Customs Legs", "sum"),
+            Workload=("Workload", "sum"),
+        )
+        .reset_index()
+    ).rename(columns={"Customs": "Customs Legs"})
+    agg["Workload"] = agg["Workload"].round(2)
     # Add spread metrics
-    total_legs = agg["Legs"].sum()
+    total_workload = agg["Workload"].sum()
     total_shifts = agg.shape[0]
-    target = total_legs / total_shifts if total_shifts else 0
-    agg["Δ Legs vs Even"] = (agg["Legs"] - target).round(1)
+    target = total_workload / total_shifts if total_shifts else 0
+    agg["Δ Workload vs Even"] = (agg["Workload"] - target).round(2)
     return agg
 
 
@@ -1359,9 +1461,22 @@ if st.session_state.get("_run"):
                 st.write("No tails assigned.")
             else:
                 st.dataframe(df, use_container_width=True, hide_index=True)
-                st.metric("Total legs", int(df["Legs"].sum()))
-                st.metric("Tails", int(df.shape[0]))
-                st.metric("Priority tails", int(sum(1 for p in pkgs if p.has_priority)))
+                total_legs = int(df["Legs"].sum())
+                total_workload = round(float(df["Workload"].sum()), 2)
+                customs_legs = int(df["Customs Legs"].sum())
+                total_tails = int(df.shape[0])
+                priority_total = int(sum(1 for p in pkgs if p.has_priority))
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("Total legs", total_legs)
+                with col2:
+                    st.metric("Workload-adjusted legs", total_workload)
+                with col3:
+                    st.metric("Customs legs", customs_legs)
+                with col4:
+                    st.metric("Tails", total_tails)
+                with col5:
+                    st.metric("Priority tails", priority_total)
 
     # Combined view
     combined_df = buckets_to_df(buckets)
