@@ -1,8 +1,11 @@
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
+from functools import lru_cache
+from pathlib import Path
 from collections.abc import Mapping
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 
 import pandas as pd
 import pytz
@@ -27,6 +30,7 @@ st.caption(
 )
 
 LOCAL_TZ = ZoneInfo("America/Edmonton")
+AIRPORT_TZ_FILENAME = "Airport TZ.txt"
 
 # ----------------------------
 # Types
@@ -70,6 +74,96 @@ def _to_local(dt: datetime, tz_name: str | None) -> datetime:
 def _tomorrow_local() -> date:
     now_local = datetime.now(LOCAL_TZ)
     return (now_local + timedelta(days=1)).date()
+
+
+def _airport_tz_path() -> Path:
+    return Path(__file__).with_name(AIRPORT_TZ_FILENAME)
+
+
+@lru_cache(maxsize=1)
+def _load_airport_tz_lookup() -> Dict[str, str]:
+    path = _airport_tz_path()
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+
+    lookup: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        tz_value = row.get("tz")
+        if not isinstance(tz_value, str):
+            continue
+        tz = tz_value.strip()
+        if not tz:
+            continue
+        for key in ("icao", "iata", "lid"):
+            code_value = row.get(key)
+            if isinstance(code_value, str) and code_value.strip():
+                lookup[code_value.strip().upper()] = tz
+    return lookup
+
+
+def _extract_codes(value: Any) -> List[str]:
+    if not isinstance(value, str):
+        return []
+    cleaned = value.strip()
+    if not cleaned:
+        return []
+    upper = cleaned.upper()
+    if upper.replace(" ", "").isalnum() and len(upper.strip()) in {3, 4}:
+        return [upper]
+    return [token.upper() for token in re.findall(r"\b[A-Za-z0-9]{3,4}\b", upper)]
+
+
+def _apply_airport_timezones(df: pd.DataFrame) -> Tuple[pd.DataFrame, Set[str], bool]:
+    if df.empty:
+        return df, set(), False
+    if "dep_tz" not in df.columns:
+        df["dep_tz"] = None
+
+    lookup = _load_airport_tz_lookup()
+    lookup_used = bool(lookup)
+
+    missing: Set[str] = set()
+    candidate_columns = [
+        "dep_airport",
+        "departure_airport",
+        "departureAirport",
+        "departure_airport_code",
+    ]
+
+    def _needs_timezone(val: Any) -> bool:
+        if val is None:
+            return True
+        if isinstance(val, float) and pd.isna(val):
+            return True
+        if isinstance(val, str) and not val.strip():
+            return True
+        return False
+
+    for idx, row in df.iterrows():
+        if not _needs_timezone(row.get("dep_tz")):
+            continue
+        airport_value: Optional[str] = None
+        for col in candidate_columns:
+            if col in df.columns and not pd.isna(row.get(col)):
+                airport_value = str(row[col])
+                if airport_value:
+                    break
+        if not airport_value:
+            continue
+        codes = _extract_codes(airport_value)
+        tz_guess = None
+        if lookup_used:
+            tz_guess = next((lookup.get(code) for code in codes if code in lookup), None)
+        if tz_guess:
+            df.at[idx, "dep_tz"] = tz_guess
+        else:
+            missing.add(airport_value)
+
+    return df, missing, lookup_used
 
 
 # ----------------------------
@@ -168,12 +262,53 @@ def fetch_next_day_legs(
         crew_summary = enrich_flights_with_crew(config, flights)
         metadata = {**metadata, "crew_summary": crew_summary}
 
-    rows = _normalize_fl3xx_payload({"items": flights})
+    rows, normalization_stats = _normalize_fl3xx_payload({"items": flights})
     if not rows:
         st.warning("FL3XX API returned no recognizable legs for the selected date.")
         return pd.DataFrame(), metadata, crew_summary
 
     df = pd.DataFrame(rows)
+    df, missing_tz_airports, tz_lookup_used = _apply_airport_timezones(df)
+
+    metadata = {
+        **metadata,
+        "normalization_stats": normalization_stats,
+        "timezone_lookup_used": tz_lookup_used,
+    }
+    if missing_tz_airports:
+        metadata["missing_dep_tz_airports"] = sorted(missing_tz_airports)
+
+    skipped_tail = normalization_stats.get("skipped_missing_tail", 0)
+    skipped_time = normalization_stats.get("skipped_missing_dep_time", 0)
+    if skipped_tail or skipped_time:
+        skipped_total = skipped_tail + skipped_time
+        st.warning(
+            "Skipped %d leg%s missing required fields (tail missing: %d, departure time missing: %d)."
+            % (
+                skipped_total,
+                "s" if skipped_total != 1 else "",
+                skipped_tail,
+                skipped_time,
+            )
+        )
+
+    if missing_tz_airports:
+        sample = ", ".join(sorted(missing_tz_airports))
+        if len(sample) > 200:
+            sample = sample[:197] + "..."
+        message = (
+            "Added timezone from airport lookup where possible. Update `%s` to cover: %s"
+            % (AIRPORT_TZ_FILENAME, sample)
+        )
+        if tz_lookup_used:
+            st.info(message)
+        else:
+            st.warning(
+                "Unable to infer departure timezones automatically because `%s` was not found. "
+                "Sample airports without tz: %s"
+                % (AIRPORT_TZ_FILENAME, sample)
+            )
+
     return df, metadata, crew_summary
 
 
@@ -184,7 +319,7 @@ def _extract_first(obj: Dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
+def _normalize_fl3xx_payload(payload: Any) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Best-effort normalization of FL3XX flights/legs payload to rows with required fields."""
 
     def _iterable_items(data: Any) -> List[Dict[str, Any]]:
@@ -204,6 +339,13 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
         items = payload
 
     normalized: List[Dict[str, Any]] = []
+    stats = {
+        "flights_processed": len(items),
+        "candidate_legs": 0,
+        "legs_normalized": 0,
+        "skipped_missing_tail": 0,
+        "skipped_missing_dep_time": 0,
+    }
     for flight in items:
         legs = []
         if isinstance(flight, dict):
@@ -224,6 +366,7 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
         for leg in legs:
             if not isinstance(leg, dict):
                 continue
+            stats["candidate_legs"] += 1
             tail = _extract_first(
                 leg,
                 "tail",
@@ -295,7 +438,11 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                 if isinstance(dep, dict):
                     dep_tz = _extract_first(dep, "timezone", "timeZone")
 
-            if not tail or not dep_time:
+            if not tail:
+                stats["skipped_missing_tail"] += 1
+                continue
+            if not dep_time:
+                stats["skipped_missing_dep_time"] += 1
                 continue
 
             def _coerce_name(container: Dict[str, Any], *keys: str) -> Optional[str]:
@@ -402,8 +549,9 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                 row["crewMembers"] = flight_tail["crewMembers"]
 
             normalized.append(row)
+            stats["legs_normalized"] += 1
 
-    return normalized
+    return normalized, stats
 
 
 def build_tail_packages(df: pd.DataFrame, target_date: date) -> List[TailPackage]:
