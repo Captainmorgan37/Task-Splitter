@@ -1480,9 +1480,6 @@ if st.session_state.get("_run"):
 
     # Combined view
     combined_df = buckets_to_df(buckets)
-    st.markdown("---")
-    st.subheader("Combined view")
-    st.dataframe(combined_df, use_container_width=True, hide_index=True)
 
     if priority_tails:
         detail_list = [
