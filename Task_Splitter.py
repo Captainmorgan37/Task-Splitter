@@ -1,7 +1,7 @@
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time, timezone
 from functools import lru_cache
 from pathlib import Path
 from collections.abc import Mapping
@@ -29,8 +29,11 @@ st.caption(
     "Assign next-day tails to on-duty shifts as evenly as possible, while keeping all legs of a tail together."
 )
 
+UTC = timezone.utc
 LOCAL_TZ = ZoneInfo("America/Edmonton")
 AIRPORT_TZ_FILENAME = "Airport TZ.txt"
+DEPARTURE_WINDOW_START_UTC = time(hour=8, tzinfo=UTC)
+DEPARTURE_WINDOW_END_UTC = time(hour=8, tzinfo=UTC)
 
 # ----------------------------
 # Types
@@ -120,6 +123,55 @@ def _is_valid_tail_registration(value: Any) -> bool:
 def _tomorrow_local() -> date:
     now_local = datetime.now(LOCAL_TZ)
     return (now_local + timedelta(days=1)).date()
+
+
+def _compute_departure_window_bounds(target_date: date) -> Tuple[datetime, datetime]:
+    start = datetime.combine(target_date, DEPARTURE_WINDOW_START_UTC)
+    end_date = target_date + timedelta(days=1)
+    end = datetime.combine(end_date, DEPARTURE_WINDOW_END_UTC)
+    return start, end
+
+
+def _format_utc(dt: datetime) -> str:
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _filter_rows_by_departure_window(
+    rows: List[Dict[str, Any]],
+    start_utc: datetime,
+    end_utc: datetime,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    stats = {
+        "total": len(rows),
+        "within_window": 0,
+        "before_window": 0,
+        "after_window": 0,
+    }
+    if not rows:
+        return [], stats
+
+    filtered: List[Dict[str, Any]] = []
+
+    for row in rows:
+        dep_raw = row.get("dep_time")
+        if dep_raw is None:
+            stats["before_window"] += 1
+            continue
+        dt = _safe_parse_dt(str(dep_raw))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        else:
+            dt = dt.astimezone(UTC)
+        if dt < start_utc:
+            stats["before_window"] += 1
+            continue
+        if dt > end_utc:
+            stats["after_window"] += 1
+            continue
+        filtered.append(row)
+        stats["within_window"] += 1
+
+    return filtered, stats
 
 
 def _airport_tz_path() -> Path:
@@ -309,7 +361,7 @@ def fetch_next_day_legs(
         flights, metadata = fetch_flights(
             config,
             from_date=target_date,
-            to_date=target_date + timedelta(days=1),
+            to_date=target_date + timedelta(days=2),
         )
     except Exception as exc:
         st.error(f"Error fetching data from FL3XX API: {exc}")
@@ -320,9 +372,30 @@ def fetch_next_day_legs(
         crew_summary = enrich_flights_with_crew(config, flights)
         metadata = {**metadata, "crew_summary": crew_summary}
 
-    rows, normalization_stats = _normalize_fl3xx_payload({"items": flights})
-    if not rows:
+    window_start_utc, window_end_utc = _compute_departure_window_bounds(target_date)
+    window_meta = {
+        "start": _format_utc(window_start_utc),
+        "end": _format_utc(window_end_utc),
+    }
+
+    normalized_rows, normalization_stats = _normalize_fl3xx_payload({"items": flights})
+    rows, window_stats = _filter_rows_by_departure_window(
+        normalized_rows, window_start_utc, window_end_utc
+    )
+    metadata = {
+        **metadata,
+        "normalization_stats": normalization_stats,
+        "departure_window_utc": window_meta,
+        "departure_window_counts": window_stats,
+    }
+    if not normalized_rows:
         st.warning("FL3XX API returned no recognizable legs for the selected date.")
+        return pd.DataFrame(), metadata, crew_summary
+    if not rows:
+        st.warning(
+            "No FL3XX legs depart within the UTC window from %s to %s."
+            % (window_meta["start"], window_meta["end"])
+        )
         return pd.DataFrame(), metadata, crew_summary
 
     df = pd.DataFrame(rows)
@@ -330,7 +403,6 @@ def fetch_next_day_legs(
 
     metadata = {
         **metadata,
-        "normalization_stats": normalization_stats,
         "timezone_lookup_used": tz_lookup_used,
     }
     if missing_tz_airports:
