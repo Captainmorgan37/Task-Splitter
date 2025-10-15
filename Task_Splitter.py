@@ -950,6 +950,9 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
     buckets: Dict[str, List[TailPackage]] = {lab: [] for lab in labels}
     totals = {lab: 0 for lab in labels}
 
+    span = max_off - min_off
+    center = min_off + span / 2 if span else min_off
+
     for pkg in sorted(packages, key=lambda p: p.first_local_dt):
         pkg_offset = _offset_hours(pkg.first_local_dt)
         min_total = min(totals.values())
@@ -959,7 +962,16 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
 
         def score(lab: str) -> tuple[float, float, float, int, int]:
             target = targets[labels.index(lab)]
-            tz_penalty = abs(pkg_offset - target)
+            if span:
+                half_span = span / 2 or 1
+                # Increase the penalty for extreme east/west packages so that
+                # far-west departures lean harder toward later shifts (and far-east
+                # toward earlier ones) than mid-range timezones.
+                normalized_extremity = min(abs(pkg_offset - center) / half_span, 2)
+                weight = 1 + normalized_extremity
+            else:
+                weight = 1.0
+            tz_penalty = abs(pkg_offset - target) * weight
             return (
                 round(abs((totals[lab] + pkg.legs) - avg_legs), 4),
                 round((totals[lab] + pkg.legs) - min_total, 4),
