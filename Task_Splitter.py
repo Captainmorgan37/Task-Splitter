@@ -815,7 +815,9 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
     min_off, max_off = min(offsets), max(offsets)
     total_legs = sum(pkg.legs for pkg in packages)
     avg_legs = total_legs / len(labels)
-    tolerance = max(1, int(round(avg_legs * 0.4))) if avg_legs else 1
+    # Keep a small tolerance so we still respect the east↔west preference, but
+    # not at the expense of an even split.
+    tolerance = max(1, int(round(avg_legs * 0.25))) if avg_legs else 1
     if len(labels) == 1:
         targets = [max_off]
     elif max_off == min_off:
@@ -834,13 +836,13 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
         if not eligible_labels:
             eligible_labels = labels
 
-        def score(lab: str) -> tuple[float, float, int, int, int]:
+        def score(lab: str) -> tuple[float, float, float, int, int]:
             target = targets[labels.index(lab)]
             tz_penalty = abs(pkg_offset - target)
             return (
-                round(tz_penalty, 4),
                 round(abs((totals[lab] + pkg.legs) - avg_legs), 4),
-                totals[lab] + pkg.legs,
+                round((totals[lab] + pkg.legs) - min_total, 4),
+                round(tz_penalty, 4),
                 len(buckets[lab]),
                 labels.index(lab),
             )
