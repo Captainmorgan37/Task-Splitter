@@ -120,9 +120,10 @@ def _is_valid_tail_registration(value: Any) -> bool:
     return False
 
 
-def _tomorrow_local() -> date:
+def _default_target_date() -> date:
+    """Return the default target date (two days ahead in local Mountain time)."""
     now_local = datetime.now(LOCAL_TZ)
-    return (now_local + timedelta(days=1)).date()
+    return (now_local + timedelta(days=2)).date()
 
 
 def _default_shift_labels(count: int) -> List[str]:
@@ -960,8 +961,8 @@ for i in range(int(num_people)):
     )
     labels.append(lbl or f"Shift {i+1}")
 
-# Date selection (default = tomorrow local)
-selected_date = st.sidebar.date_input("Target date", value=_tomorrow_local())
+# Date selection (default = two days ahead in local Mountain time)
+selected_date = st.sidebar.date_input("Target date", value=_default_target_date())
 
 
 # ----------------------------
