@@ -640,6 +640,9 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
 
     offsets = [_offset_hours(pkg.first_local_dt) for pkg in packages]
     min_off, max_off = min(offsets), max(offsets)
+    total_legs = sum(pkg.legs for pkg in packages)
+    avg_legs = total_legs / len(labels)
+    tolerance = max(1, int(round(avg_legs * 0.4))) if avg_legs else 1
     if len(labels) == 1:
         targets = [min_off]
     elif max_off == min_off:
@@ -652,17 +655,23 @@ def assign_preference_weighted(packages: List[TailPackage], labels: List[str]) -
 
     for pkg in sorted(packages, key=lambda p: p.first_local_dt):
         pkg_offset = _offset_hours(pkg.first_local_dt)
+        min_total = min(totals.values())
+        eligible_labels = [lab for lab in labels if totals[lab] <= min_total + tolerance]
+        if not eligible_labels:
+            eligible_labels = labels
 
-        def score(lab: str) -> tuple[float, int, int]:
+        def score(lab: str) -> tuple[float, float, int, int, int]:
             target = targets[labels.index(lab)]
             tz_penalty = abs(pkg_offset - target)
             return (
                 round(tz_penalty, 4),
+                round(abs((totals[lab] + pkg.legs) - avg_legs), 4),
                 totals[lab] + pkg.legs,
                 len(buckets[lab]),
+                labels.index(lab),
             )
 
-        label = min(labels, key=score)
+        label = min(eligible_labels, key=score)
         buckets[label].append(pkg)
         totals[label] += pkg.legs
 
