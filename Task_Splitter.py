@@ -1401,8 +1401,18 @@ selected_date = st.sidebar.date_input("Target date", value=_default_target_date(
 # ----------------------------
 # Main Action
 # ----------------------------
-if st.button("🔄 Fetch & Assign", use_container_width=True):
-    st.session_state["_run"] = True
+fetch_col, reset_col = st.columns([4, 1])
+with fetch_col:
+    if st.button("🔄 Fetch & Assign", use_container_width=True):
+        st.session_state["_run"] = True
+with reset_col:
+    if st.button("🧹 Clear cache", use_container_width=True):
+        fetch_next_day_legs.clear()
+        st.session_state.pop("_run", None)
+        st.session_state["_cache_cleared"] = True
+
+if st.session_state.pop("_cache_cleared", False):
+    st.success("Cached data cleared. Fetch again to pull fresh data.")
 
 # ----------------------------
 # Processing & Output
