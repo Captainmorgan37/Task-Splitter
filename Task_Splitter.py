@@ -231,6 +231,8 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                 "tail_number",
                 "aircraft",
                 "aircraftRegistration",
+                "registrationNumber",
+                "registration",
             )
             if not tail and isinstance(flight_tail, dict):
                 tail = _extract_first(
@@ -240,6 +242,17 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                     "tail_number",
                     "aircraft",
                     "aircraftRegistration",
+                    "registrationNumber",
+                    "registration",
+                )
+            if isinstance(tail, dict):
+                tail = _extract_first(
+                    tail,
+                    "registrationNumber",
+                    "registration",
+                    "tailNumber",
+                    "tail",
+                    "name",
                 )
 
             leg_id = _extract_first(
@@ -261,6 +274,11 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                 "offBlockTimeUtc",
                 "scheduledTimeUtc",
                 "scheduled_departure_utc",
+                "blockOffEstUTC",
+                "blockOffUtc",
+                "scheduledOffBlockUtc",
+                "blockOffTimeUtc",
+                "blockOffActualUTC",
             )
 
             dep_tz = _extract_first(
@@ -269,6 +287,8 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                 "departureTimeZone",
                 "departure_timezone",
                 "departure_tz",
+                "blockOffTimeZone",
+                "offBlockTimeZone",
             )
             if not dep_tz:
                 dep = leg.get("departure") if isinstance(leg.get("departure"), dict) else {}
@@ -338,6 +358,8 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                 "departureAirportIata",
                 "departureAirportName",
                 "departure",
+                "airportFrom",
+                "fromAirport",
             )
             if isinstance(dep_airport, dict):
                 dep_airport = _extract_first(
@@ -346,6 +368,7 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                     "iata",
                     "code",
                     "name",
+                    "airport",
                 )
             if dep_airport:
                 row["departure_airport"] = str(dep_airport)
@@ -358,6 +381,8 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                 "arrivalAirportIata",
                 "arrivalAirportName",
                 "arrival",
+                "airportTo",
+                "toAirport",
             )
             if isinstance(arr_airport, dict):
                 arr_airport = _extract_first(
@@ -366,6 +391,7 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
                     "iata",
                     "code",
                     "name",
+                    "airport",
                 )
             if arr_airport:
                 row["arrival_airport"] = str(arr_airport)
