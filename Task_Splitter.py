@@ -1,6 +1,6 @@
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date
 from functools import lru_cache
 from pathlib import Path
@@ -41,6 +41,8 @@ class TailPackage:
     legs: int
     first_local_dt: datetime  # first dep local datetime for the day
     sample_legs: List[Dict[str, Any]]  # optional preview rows for UI (subset)
+    has_priority: bool = False
+    priority_labels: List[str] = field(default_factory=list)
 
 
 # ----------------------------
@@ -69,6 +71,20 @@ def _to_local(dt: datetime, tz_name: str | None) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=pytz.UTC)
     return dt.astimezone(LOCAL_TZ)
+
+
+def _priority_label(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        text = str(value).strip()
+    if not text:
+        return None
+    if "priority" in text.lower():
+        return text
+    return None
 
 
 def _tomorrow_local() -> date:
@@ -186,7 +202,13 @@ def fetch_next_day_legs(
         # ---------- STUB DATA (edit as desired) ----------
         # 6 tails, uneven leg counts, mixed timezones
         raw = [
-            {"tail": "C-GASL", "leg_id": "L1", "dep_time": f"{target_date}T06:15:00-04:00", "dep_tz": "America/New_York"},
+            {
+                "tail": "C-GASL",
+                "leg_id": "L1",
+                "dep_time": f"{target_date}T06:15:00-04:00",
+                "dep_tz": "America/New_York",
+                "workflowCustomName": "FEX Guaranteed",
+            },
             {"tail": "C-GASL", "leg_id": "L2", "dep_time": f"{target_date}T09:40:00-04:00", "dep_tz": "America/New_York"},
 
             {"tail": "C-FLYR", "leg_id": "L3", "dep_time": f"{target_date}T05:55:00-07:00", "dep_tz": "America/Los_Angeles"},
@@ -195,7 +217,13 @@ def fetch_next_day_legs(
             {"tail": "C-JETA", "leg_id": "L5", "dep_time": f"{target_date}T12:10:00-06:00", "dep_tz": "America/Denver"},
             {"tail": "C-JETA", "leg_id": "L6", "dep_time": f"{target_date}T18:25:00-06:00", "dep_tz": "America/Denver"},
 
-            {"tail": "C-LEGC", "leg_id": "L7", "dep_time": f"{target_date}T14:45:00+01:00", "dep_tz": "Europe/London"},
+            {
+                "tail": "C-LEGC",
+                "leg_id": "L7",
+                "dep_time": f"{target_date}T14:45:00+01:00",
+                "dep_tz": "Europe/London",
+                "workflowCustomName": "Priority Charter",
+            },
             {"tail": "C-LEGC", "leg_id": "L8", "dep_time": f"{target_date}T19:30:00+01:00", "dep_tz": "Europe/London"},
 
             {"tail": "C-CJ25", "leg_id": "L9", "dep_time": f"{target_date}T06:05:00-05:00", "dep_tz": "America/Chicago"},
@@ -486,6 +514,22 @@ def _normalize_fl3xx_payload(payload: Any) -> Tuple[List[Dict[str, Any]], Dict[s
                     "firstOfficer",
                 )
 
+            workflow_custom_name = _extract_first(
+                leg,
+                "workflowCustomName",
+                "workflow_custom_name",
+                "workflowName",
+                "workflow",
+            )
+            if not workflow_custom_name and isinstance(flight_tail, dict):
+                workflow_custom_name = _extract_first(
+                    flight_tail,
+                    "workflowCustomName",
+                    "workflow_custom_name",
+                    "workflowName",
+                    "workflow",
+                )
+
             row = {
                 "tail": str(tail),
                 "leg_id": str(leg_id) if leg_id is not None else str(len(normalized) + 1),
@@ -496,6 +540,8 @@ def _normalize_fl3xx_payload(payload: Any) -> Tuple[List[Dict[str, Any]], Dict[s
                 row["picName"] = pic_name
             if sic_name:
                 row["sicName"] = sic_name
+            if workflow_custom_name:
+                row["workflowCustomName"] = str(workflow_custom_name)
 
             dep_airport = _extract_first(
                 leg,
@@ -584,16 +630,23 @@ def build_tail_packages(df: pd.DataFrame, target_date: date) -> List[TailPackage
     packages: List[TailPackage] = []
     for tail, g in df.groupby("tail", sort=False):
         # Limit to target_date legs (by local date)
-        legs_rows = []
+        legs_rows: List[Dict[str, Any]] = []
+        all_rows: List[Dict[str, Any]] = []
+        priority_values: Set[str] = set()
         for _, row in g.iterrows():
-            dt = _safe_parse_dt(str(row["dep_time"]))
-            tz_name = str(row.get("dep_tz", "")) or None
+            row_dict = row.to_dict()
+            all_rows.append(row_dict)
+            priority_label = _priority_label(row_dict.get("workflowCustomName"))
+            if priority_label:
+                priority_values.add(priority_label)
+            dt = _safe_parse_dt(str(row_dict["dep_time"]))
+            tz_name = str(row_dict.get("dep_tz", "")) or None
             dt_local = _to_local(dt, tz_name)
             if dt_local.date() == target_date:
-                legs_rows.append(row.to_dict())
+                legs_rows.append(row_dict)
         # If none strictly on target_date by local, treat all as same-day package
         if not legs_rows:
-            legs_rows = [row.to_dict() for _, row in g.iterrows()]
+            legs_rows = all_rows
         first_dt = first_local_for_tail(pd.DataFrame(legs_rows))
         packages.append(
             TailPackage(
@@ -601,6 +654,8 @@ def build_tail_packages(df: pd.DataFrame, target_date: date) -> List[TailPackage
                 legs=len(legs_rows),
                 first_local_dt=first_dt,
                 sample_legs=legs_rows[:3],
+                has_priority=bool(priority_values),
+                priority_labels=sorted(priority_values),
             )
         )
     return packages
@@ -687,6 +742,8 @@ def buckets_to_df(buckets: Dict[str, List[TailPackage]]) -> pd.DataFrame:
                 "Tail": pkg.tail,
                 "Legs": pkg.legs,
                 "First Local Dep": pkg.first_local_dt.strftime("%Y-%m-%d %H:%M %Z"),
+                "Priority Flight": "Yes" if pkg.has_priority else "No",
+                "Priority Detail": ", ".join(pkg.priority_labels) if pkg.priority_labels else "",
             })
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -824,6 +881,13 @@ if st.session_state.get("_run"):
         st.info("No tail packages found for the selected date.")
         st.stop()
 
+    priority_packages = [pkg for pkg in packages if pkg.has_priority]
+    priority_tails = [pkg.tail for pkg in priority_packages]
+    priority_details = {
+        pkg.tail: ", ".join(pkg.priority_labels) if pkg.priority_labels else ""
+        for pkg in priority_packages
+    }
+
     st.subheader("Assignments")
 
     if assign_mode.startswith("Round-robin"):
@@ -845,12 +909,22 @@ if st.session_state.get("_run"):
                 st.dataframe(df, use_container_width=True, hide_index=True)
                 st.metric("Total legs", int(df["Legs"].sum()))
                 st.metric("Tails", int(df.shape[0]))
+                st.metric("Priority tails", int(sum(1 for p in pkgs if p.has_priority)))
 
     # Combined view
     combined_df = buckets_to_df(buckets)
     st.markdown("---")
     st.subheader("Combined view")
     st.dataframe(combined_df, use_container_width=True, hide_index=True)
+
+    if priority_tails:
+        detail_list = [
+            f"{tail} ({priority_details[tail]})" if priority_details[tail] else tail
+            for tail in priority_tails
+        ]
+        st.warning(
+            "Priority flights detected for: " + ", ".join(detail_list)
+        )
 
     # Summary
     st.subheader("Summary")
@@ -868,11 +942,18 @@ if st.session_state.get("_run"):
 
     # JSON mapping for integrations
     mapping = {lab: [p.tail for p in buckets.get(lab, [])] for lab in labels}
-    st.code(json.dumps({
+    payload = {
         "date": str(selected_date),
         "mode": assign_mode,
         "mapping": mapping,
-    }, indent=2))
+    }
+    if priority_tails:
+        payload["priority_tails"] = priority_tails
+        payload["priority_details"] = {
+            tail: priority_details[tail] or "Priority"
+            for tail in priority_tails
+        }
+    st.code(json.dumps(payload, indent=2))
 
     st.success("Done. Adjust labels or mode and re-run as needed.")
 
