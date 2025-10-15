@@ -1,12 +1,13 @@
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 from typing import List, Dict, Any
 
 import pandas as pd
 import pytz
 from zoneinfo import ZoneInfo
 import streamlit as st
+import requests
 
 # ----------------------------
 # App Config
@@ -68,8 +69,14 @@ def _tomorrow_local() -> date:
 # Data Fetch (stub or real)
 # ----------------------------
 @st.cache_data(show_spinner=False)
-def fetch_next_day_legs(target_date: date, *, use_stub: bool,
-                        api_url: str | None = None, api_token: str | None = None) -> pd.DataFrame:
+def fetch_next_day_legs(
+    target_date: date,
+    *,
+    use_stub: bool,
+    api_url: str | None = None,
+    api_token: str | None = None,
+    auth_header_name: str = "Authorization",
+) -> pd.DataFrame:
     """
     Return a DataFrame of legs for target_date with columns at least:
       tail (str), leg_id (str/int), dep_time (ISO str), dep_tz (IANA tz name)
@@ -98,18 +105,159 @@ def fetch_next_day_legs(target_date: date, *, use_stub: bool,
         ]
         return pd.DataFrame(raw)
 
-    # ---------- REAL FETCH (adapt to your API) ----------
-    # Example shape: GET api_url?date=YYYY-MM-DD with bearer token
-    # This is a placeholder; replace with your request logic (requests, aiohttp, etc.).
-    # We keep it cached to avoid hammering the API during UI play.
-    st.warning("Real API fetch block is a placeholder. Replace with actual requests code.")
-    # import requests
-    # headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
-    # resp = requests.get(api_url, params={"date": target_date.isoformat()}, headers=headers, timeout=30)
-    # resp.raise_for_status()
-    # rows = resp.json()
-    # return pd.DataFrame(rows)
-    return pd.DataFrame([])
+    # ---------- REAL FETCH ----------
+    if not api_url:
+        st.error("API URL required when real data mode is enabled.")
+        return pd.DataFrame()
+    if not api_token:
+        st.error("API token required when real data mode is enabled.")
+        return pd.DataFrame()
+
+    start_local = datetime.combine(target_date, time.min, tzinfo=LOCAL_TZ)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(pytz.UTC)
+    end_utc = end_local.astimezone(pytz.UTC)
+
+    params = {
+        "start": start_utc.isoformat().replace("+00:00", "Z"),
+        "end": end_utc.isoformat().replace("+00:00", "Z"),
+        "date": target_date.isoformat(),
+    }
+
+    headers = {auth_header_name: api_token}
+
+    try:
+        response = requests.get(api_url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        st.error(f"Error fetching data from API: {exc}")
+        return pd.DataFrame()
+
+    try:
+        payload = response.json()
+    except ValueError:
+        st.error("API response was not valid JSON.")
+        return pd.DataFrame()
+
+    rows = _normalize_fl3xx_payload(payload)
+    if not rows:
+        st.warning("API returned no recognizable legs for the selected date.")
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+def _extract_first(obj: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in obj and obj[key] not in (None, ""):
+            return obj[key]
+    return None
+
+
+def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Best-effort normalization of FL3XX flights/legs payload to rows with required fields."""
+
+    def _iterable_items(data: Any) -> List[Dict[str, Any]]:
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("data", "items", "flights", "legs"):
+                nested = data.get(key)
+                if isinstance(nested, list):
+                    return nested
+        return []
+
+    items = _iterable_items(payload)
+    if not items and isinstance(payload, dict):
+        items = [payload]
+    elif not items and isinstance(payload, list):
+        items = payload
+
+    normalized: List[Dict[str, Any]] = []
+    for flight in items:
+        legs = []
+        if isinstance(flight, dict):
+            legs_data = flight.get("legs")
+            if isinstance(legs_data, list) and legs_data:
+                legs = legs_data
+            else:
+                legs = [flight]
+        elif isinstance(flight, list):
+            legs = flight
+        else:
+            continue
+
+        flight_tail = {}
+        if isinstance(flight, dict):
+            flight_tail = flight
+
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            tail = _extract_first(
+                leg,
+                "tail",
+                "tailNumber",
+                "tail_number",
+                "aircraft",
+                "aircraftRegistration",
+            )
+            if not tail and isinstance(flight_tail, dict):
+                tail = _extract_first(
+                    flight_tail,
+                    "tail",
+                    "tailNumber",
+                    "tail_number",
+                    "aircraft",
+                    "aircraftRegistration",
+                )
+
+            leg_id = _extract_first(
+                leg,
+                "id",
+                "legId",
+                "leg_id",
+                "uuid",
+                "externalId",
+                "external_id",
+            )
+
+            dep_time = _extract_first(
+                leg,
+                "departureTimeUtc",
+                "departure_time_utc",
+                "departureTime",
+                "departure_time",
+                "offBlockTimeUtc",
+                "scheduledTimeUtc",
+                "scheduled_departure_utc",
+            )
+
+            dep_tz = _extract_first(
+                leg,
+                "departureTimezone",
+                "departureTimeZone",
+                "departure_timezone",
+                "departure_tz",
+            )
+            if not dep_tz:
+                dep = leg.get("departure") if isinstance(leg.get("departure"), dict) else {}
+                if isinstance(dep, dict):
+                    dep_tz = _extract_first(dep, "timezone", "timeZone")
+
+            if not tail or not dep_time:
+                continue
+
+            normalized.append(
+                {
+                    "tail": str(tail),
+                    "leg_id": str(leg_id) if leg_id is not None else str(len(normalized) + 1),
+                    "dep_time": dep_time,
+                    "dep_tz": dep_tz,
+                }
+            )
+
+    return normalized
 
 
 def build_tail_packages(df: pd.DataFrame, target_date: date) -> List[TailPackage]:
@@ -259,9 +407,29 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
 # Sidebar: Inputs
 # ----------------------------
 st.sidebar.header("Inputs")
-use_stub = st.sidebar.toggle("Use stub data", value=True, help="Uncheck to use your real API block (placeholder).")
-api_url = st.sidebar.text_input("API URL (optional)")
-api_token = st.sidebar.text_input("API Token (optional)", type="password")
+
+fl3xx_cfg: Dict[str, Any] = {}
+try:
+    if "fl3xx_api" in st.secrets:
+        cfg = st.secrets["fl3xx_api"]
+        if isinstance(cfg, dict):
+            fl3xx_cfg = dict(cfg)
+except Exception:
+    # Accessing secrets outside Streamlit Cloud may raise; ignore gracefully.
+    fl3xx_cfg = {}
+
+default_api_url = str(fl3xx_cfg.get("base_url", "")) if fl3xx_cfg else ""
+default_api_token = str(fl3xx_cfg.get("api_token", "")) if fl3xx_cfg else ""
+default_auth_header = str(fl3xx_cfg.get("auth_header_name", "X-Auth-Token")) if fl3xx_cfg else "X-Auth-Token"
+
+use_stub = st.sidebar.toggle(
+    "Use stub data",
+    value=not bool(default_api_url and default_api_token),
+    help="Uncheck to use your real FL3XX API.",
+)
+api_url = st.sidebar.text_input("API URL", value=default_api_url)
+api_token = st.sidebar.text_input("API Token", value=default_api_token, type="password")
+auth_header_name = st.sidebar.text_input("Auth header name", value=default_auth_header)
 
 assign_mode = st.sidebar.radio(
     "Assignment mode",
@@ -311,7 +479,13 @@ with col2:
 # Processing & Output
 # ----------------------------
 if st.session_state.get("_run"):
-    legs_df = fetch_next_day_legs(selected_date, use_stub=use_stub, api_url=api_url or None, api_token=api_token or None)
+    legs_df = fetch_next_day_legs(
+        selected_date,
+        use_stub=use_stub,
+        api_url=api_url or None,
+        api_token=api_token or None,
+        auth_header_name=auth_header_name or "Authorization",
+    )
 
     if legs_df.empty:
         st.warning("No legs returned for the selected date.")
@@ -385,8 +559,8 @@ st.markdown(
     """
 ---
 ### How to wire your real API
-1. Replace the `fetch_next_day_legs` placeholder with your real `requests.get(...)` call.
-2. Ensure your API returns at least these fields per leg: `tail`, `leg_id`, `dep_time` (ISO with tz if possible), `dep_tz` (IANA name).
+1. Store your FL3XX credentials inside `.streamlit/secrets.toml` under `[fl3xx_api]` to auto-populate the sidebar inputs.
+2. If your payload structure differs, tweak `_normalize_fl3xx_payload` so each row exposes `tail`, `leg_id`, `dep_time`, and optionally `dep_tz`.
 3. If your API only has departure airport (e.g., `dep_apt`), add a lookup to map airport → IANA tz and set `dep_tz` before calling `build_tail_packages`.
 4. The *round-robin* mode sorts packages by the first local departure time per tail and distributes in sequence.
 5. The *balanced* mode packs by legs to minimize spread.
