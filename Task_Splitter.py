@@ -1,13 +1,19 @@
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date, time
-from typing import List, Dict, Any
+from datetime import datetime, timedelta, date
+from typing import List, Dict, Any, Tuple, Optional
 
 import pandas as pd
 import pytz
 from zoneinfo import ZoneInfo
 import streamlit as st
-import requests
+
+from fl3xx_api import (
+    DEFAULT_FL3XX_BASE_URL,
+    Fl3xxApiConfig,
+    enrich_flights_with_crew,
+    fetch_flights,
+)
 
 # ----------------------------
 # App Config
@@ -73,10 +79,9 @@ def fetch_next_day_legs(
     target_date: date,
     *,
     use_stub: bool,
-    api_url: str | None = None,
-    api_token: str | None = None,
-    auth_header_name: str = "Authorization",
-) -> pd.DataFrame:
+    fl3xx_settings: Optional[Dict[str, Any]] = None,
+    fetch_crew: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[Dict[str, Any]]]:
     """
     Return a DataFrame of legs for target_date with columns at least:
       tail (str), leg_id (str/int), dep_time (ISO str), dep_tz (IANA tz name)
@@ -103,48 +108,72 @@ def fetch_next_day_legs(
             {"tail": "C-HAWK", "leg_id": "L10", "dep_time": f"{target_date}T08:00:00-06:00", "dep_tz": "America/Denver"},
             {"tail": "C-HAWK", "leg_id": "L11", "dep_time": f"{target_date}T16:40:00-06:00", "dep_tz": "America/Denver"},
         ]
-        return pd.DataFrame(raw)
+        return pd.DataFrame(raw), {}, None
 
     # ---------- REAL FETCH ----------
-    if not api_url:
-        st.error("API URL required when real data mode is enabled.")
-        return pd.DataFrame()
-    if not api_token:
-        st.error("API token required when real data mode is enabled.")
-        return pd.DataFrame()
+    if not fl3xx_settings:
+        st.error("FL3XX API secrets are not configured; falling back to stub data is recommended.")
+        return pd.DataFrame(), {}, None
 
-    start_local = datetime.combine(target_date, time.min, tzinfo=LOCAL_TZ)
-    end_local = start_local + timedelta(days=1)
-    start_utc = start_local.astimezone(pytz.UTC)
-    end_utc = end_local.astimezone(pytz.UTC)
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return default
 
-    params = {
-        "start": start_utc.isoformat().replace("+00:00", "Z"),
-        "end": end_utc.isoformat().replace("+00:00", "Z"),
-        "date": target_date.isoformat(),
-    }
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
-    headers = {auth_header_name: api_token}
+    extra_headers = fl3xx_settings.get("extra_headers")
+    if isinstance(extra_headers, dict):
+        sanitized_headers = {str(k): str(v) for k, v in extra_headers.items()}
+    else:
+        sanitized_headers = {}
+
+    extra_params = fl3xx_settings.get("extra_params")
+    if isinstance(extra_params, dict):
+        sanitized_params = {str(k): str(v) for k, v in extra_params.items()}
+    else:
+        sanitized_params = {}
+
+    config = Fl3xxApiConfig(
+        base_url=str(fl3xx_settings.get("base_url") or DEFAULT_FL3XX_BASE_URL),
+        api_token=str(fl3xx_settings.get("api_token")) if fl3xx_settings.get("api_token") else None,
+        auth_header=str(fl3xx_settings.get("auth_header")) if fl3xx_settings.get("auth_header") else None,
+        auth_header_name=str(fl3xx_settings.get("auth_header_name") or "Authorization"),
+        api_token_scheme=str(fl3xx_settings.get("api_token_scheme")) if fl3xx_settings.get("api_token_scheme") else None,
+        extra_headers=sanitized_headers,
+        verify_ssl=_coerce_bool(fl3xx_settings.get("verify_ssl"), True),
+        timeout=_coerce_int(fl3xx_settings.get("timeout"), 30),
+        extra_params=sanitized_params,
+    )
 
     try:
-        response = requests.get(api_url, params=params, headers=headers, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        st.error(f"Error fetching data from API: {exc}")
-        return pd.DataFrame()
+        flights, metadata = fetch_flights(
+            config,
+            from_date=target_date,
+            to_date=target_date + timedelta(days=1),
+        )
+    except Exception as exc:
+        st.error(f"Error fetching data from FL3XX API: {exc}")
+        return pd.DataFrame(), {}, None
 
-    try:
-        payload = response.json()
-    except ValueError:
-        st.error("API response was not valid JSON.")
-        return pd.DataFrame()
+    crew_summary: Optional[Dict[str, Any]] = None
+    if fetch_crew:
+        crew_summary = enrich_flights_with_crew(config, flights)
+        metadata = {**metadata, "crew_summary": crew_summary}
 
-    rows = _normalize_fl3xx_payload(payload)
+    rows = _normalize_fl3xx_payload({"items": flights})
     if not rows:
-        st.warning("API returned no recognizable legs for the selected date.")
-        return pd.DataFrame()
+        st.warning("FL3XX API returned no recognizable legs for the selected date.")
+        return pd.DataFrame(), metadata, crew_summary
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    return df, metadata, crew_summary
 
 
 def _extract_first(obj: Dict[str, Any], *keys: str) -> Any:
@@ -248,14 +277,104 @@ def _normalize_fl3xx_payload(payload: Any) -> List[Dict[str, Any]]:
             if not tail or not dep_time:
                 continue
 
-            normalized.append(
-                {
-                    "tail": str(tail),
-                    "leg_id": str(leg_id) if leg_id is not None else str(len(normalized) + 1),
-                    "dep_time": dep_time,
-                    "dep_tz": dep_tz,
-                }
+            def _coerce_name(container: Dict[str, Any], *keys: str) -> Optional[str]:
+                value = _extract_first(container, *keys)
+                if value is None:
+                    return None
+                value_str = str(value).strip()
+                return value_str or None
+
+            pic_name = _coerce_name(
+                leg,
+                "picName",
+                "pic",
+                "pic_name",
+                "captainName",
+                "captain",
             )
+            if not pic_name and isinstance(flight_tail, dict):
+                pic_name = _coerce_name(
+                    flight_tail,
+                    "picName",
+                    "pic",
+                    "pic_name",
+                    "captainName",
+                    "captain",
+                )
+
+            sic_name = _coerce_name(
+                leg,
+                "sicName",
+                "sic",
+                "foName",
+                "firstOfficer",
+            )
+            if not sic_name and isinstance(flight_tail, dict):
+                sic_name = _coerce_name(
+                    flight_tail,
+                    "sicName",
+                    "sic",
+                    "foName",
+                    "firstOfficer",
+                )
+
+            row = {
+                "tail": str(tail),
+                "leg_id": str(leg_id) if leg_id is not None else str(len(normalized) + 1),
+                "dep_time": dep_time,
+                "dep_tz": dep_tz,
+            }
+            if pic_name:
+                row["picName"] = pic_name
+            if sic_name:
+                row["sicName"] = sic_name
+
+            dep_airport = _extract_first(
+                leg,
+                "departureAirport",
+                "departureAirportCode",
+                "departureAirportIcao",
+                "departureAirportIata",
+                "departureAirportName",
+                "departure",
+            )
+            if isinstance(dep_airport, dict):
+                dep_airport = _extract_first(
+                    dep_airport,
+                    "icao",
+                    "iata",
+                    "code",
+                    "name",
+                )
+            if dep_airport:
+                row["departure_airport"] = str(dep_airport)
+
+            arr_airport = _extract_first(
+                leg,
+                "arrivalAirport",
+                "arrivalAirportCode",
+                "arrivalAirportIcao",
+                "arrivalAirportIata",
+                "arrivalAirportName",
+                "arrival",
+            )
+            if isinstance(arr_airport, dict):
+                arr_airport = _extract_first(
+                    arr_airport,
+                    "icao",
+                    "iata",
+                    "code",
+                    "name",
+                )
+            if arr_airport:
+                row["arrival_airport"] = str(arr_airport)
+
+            if isinstance(leg.get("crewMembers"), list):
+                row["crewMembers"] = leg["crewMembers"]
+            elif isinstance(flight_tail, dict) and isinstance(flight_tail.get("crewMembers"), list):
+                row["crewMembers"] = flight_tail["crewMembers"]
+
+            normalized.append(row)
 
     return normalized
 
@@ -418,18 +537,29 @@ except Exception:
     # Accessing secrets outside Streamlit Cloud may raise; ignore gracefully.
     fl3xx_cfg = {}
 
-default_api_url = str(fl3xx_cfg.get("base_url", "")) if fl3xx_cfg else ""
-default_api_token = str(fl3xx_cfg.get("api_token", "")) if fl3xx_cfg else ""
-default_auth_header = str(fl3xx_cfg.get("auth_header_name", "X-Auth-Token")) if fl3xx_cfg else "X-Auth-Token"
+has_live_credentials = bool(fl3xx_cfg.get("base_url") and (fl3xx_cfg.get("api_token") or fl3xx_cfg.get("auth_header")))
 
 use_stub = st.sidebar.toggle(
     "Use stub data",
-    value=not bool(default_api_url and default_api_token),
-    help="Uncheck to use your real FL3XX API.",
+    value=not has_live_credentials,
+    help="Uncheck to use your real FL3XX API (credentials stored in Streamlit secrets).",
+    disabled=not has_live_credentials,
 )
-api_url = st.sidebar.text_input("API URL", value=default_api_url)
-api_token = st.sidebar.text_input("API Token", value=default_api_token, type="password")
-auth_header_name = st.sidebar.text_input("Auth header name", value=default_auth_header)
+
+if not has_live_credentials:
+    st.sidebar.info(
+        "Add your FL3XX credentials to `.streamlit/secrets.toml` under `[fl3xx_api]` to enable live fetching.",
+    )
+else:
+    st.sidebar.success("Using FL3XX credentials from Streamlit secrets.")
+
+fetch_crew_default = bool(fl3xx_cfg.get("fetch_crew", True))
+fetch_crew = st.sidebar.toggle(
+    "Fetch crew details",
+    value=fetch_crew_default,
+    help="Retrieve crew information (PIC/SIC) for each flight. Requires additional API calls.",
+    disabled=use_stub,
+)
 
 assign_mode = st.sidebar.radio(
     "Assignment mode",
@@ -479,12 +609,11 @@ with col2:
 # Processing & Output
 # ----------------------------
 if st.session_state.get("_run"):
-    legs_df = fetch_next_day_legs(
+    legs_df, fetch_metadata, crew_summary = fetch_next_day_legs(
         selected_date,
         use_stub=use_stub,
-        api_url=api_url or None,
-        api_token=api_token or None,
-        auth_header_name=auth_header_name or "Authorization",
+        fl3xx_settings=fl3xx_cfg if not use_stub else None,
+        fetch_crew=bool(fetch_crew and not use_stub),
     )
 
     if legs_df.empty:
@@ -493,6 +622,15 @@ if st.session_state.get("_run"):
 
     with st.expander("Raw legs (preview)", expanded=False):
         st.dataframe(legs_df, use_container_width=True)
+
+    if fetch_metadata:
+        with st.expander("FL3XX fetch metadata", expanded=False):
+            st.json(fetch_metadata)
+
+    if crew_summary and crew_summary.get("fetched"):
+        st.sidebar.metric("Crew lookups", int(crew_summary["fetched"]))
+        if crew_summary.get("errors"):
+            st.sidebar.warning(f"Crew errors: {len(crew_summary['errors'])}")
 
     packages = build_tail_packages(legs_df, selected_date)
 
