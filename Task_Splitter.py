@@ -1401,20 +1401,8 @@ selected_date = st.sidebar.date_input("Target date", value=_default_target_date(
 # ----------------------------
 # Main Action
 # ----------------------------
-col1, col2 = st.columns([1, 2])
-with col1:
-    if st.button("🔄 Fetch & Assign", use_container_width=True):
-        st.session_state["_run"] = True
-
-# Show current settings
-with col2:
-    st.write(
-        "**Settings:**",
-        {
-            "date": str(selected_date),
-            "labels": labels,
-        }
-    )
+if st.button("🔄 Fetch & Assign", use_container_width=True):
+    st.session_state["_run"] = True
 
 # ----------------------------
 # Processing & Output
