@@ -120,6 +120,14 @@ def _priority_label(value: Any) -> Optional[str]:
 
 
 def _normalize_person_name(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except TypeError:
+        # Non-numeric objects like dicts or custom classes may raise here; treat them normally.
+        pass
     if not value:
         return ""
     text = str(value).strip()
