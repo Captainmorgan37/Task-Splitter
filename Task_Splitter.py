@@ -11,6 +11,7 @@ import pandas as pd
 import pytz
 from zoneinfo import ZoneInfo
 import streamlit as st
+from pandas.api.types import is_scalar
 
 from docx import Document
 from docx.enum.section import WD_ORIENTATION
@@ -122,11 +123,14 @@ def _priority_label(value: Any) -> Optional[str]:
 def _normalize_person_name(value: Any) -> str:
     if value is None:
         return ""
+    if not is_scalar(value):
+        # Lists/dicts sometimes store crew metadata; ignore them here.
+        return ""
     try:
         if pd.isna(value):
             return ""
-    except TypeError:
-        # Non-numeric objects like dicts or custom classes may raise here; treat them normally.
+    except (TypeError, ValueError):
+        # Non-scalar objects or custom classes may raise here; treat them as empty.
         pass
     if not value:
         return ""
