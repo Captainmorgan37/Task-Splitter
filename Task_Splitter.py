@@ -133,6 +133,39 @@ def _member_display_name(member: Mapping[str, Any]) -> str:
     return ""
 
 
+_SUBCHARTER_PATTERN = re.compile(r"subcharter", re.IGNORECASE)
+
+
+def _workflow_indicates_subcharter(value: Any) -> bool:
+    if value is None:
+        return False
+    return bool(_SUBCHARTER_PATTERN.search(str(value)))
+
+
+def _filter_out_subcharter_rows(
+    rows: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], int]:
+    filtered: List[Dict[str, Any]] = []
+    skipped = 0
+    for row in rows:
+        workflow_value: Optional[Any] = None
+        if isinstance(row, Mapping):
+            for key in (
+                "workflowCustomName",
+                "workflow_custom_name",
+                "workflowName",
+                "workflow",
+            ):
+                if key in row and row[key] not in (None, ""):
+                    workflow_value = row[key]
+                    break
+        if _workflow_indicates_subcharter(workflow_value):
+            skipped += 1
+            continue
+        filtered.append(row)
+    return filtered, skipped
+
+
 _PIC_KEYWORDS = {
     "pic",
     "picname",
@@ -434,7 +467,16 @@ def fetch_next_day_legs(
             {"tail": "C-HAWK", "leg_id": "L10", "dep_time": f"{target_date}T08:00:00-06:00", "dep_tz": "America/Denver"},
             {"tail": "C-HAWK", "leg_id": "L11", "dep_time": f"{target_date}T16:40:00-06:00", "dep_tz": "America/Denver"},
         ]
-        return pd.DataFrame(raw), {}, None
+        filtered_raw, skipped_subcharter = _filter_out_subcharter_rows(raw)
+        if skipped_subcharter:
+            st.info(
+                "Skipped %d leg%s because the workflow contains 'Subcharter'."
+                % (skipped_subcharter, "s" if skipped_subcharter != 1 else "")
+            )
+        metadata: Dict[str, Any] = {}
+        if skipped_subcharter:
+            metadata["skipped_subcharter_legs"] = skipped_subcharter
+        return pd.DataFrame(filtered_raw), metadata, None
 
     # ---------- REAL FETCH ----------
     if not fl3xx_settings:
@@ -500,6 +542,14 @@ def fetch_next_day_legs(
     }
 
     normalized_rows, normalization_stats = _normalize_fl3xx_payload({"items": flights})
+    original_normalized_count = len(normalized_rows)
+    normalized_rows, skipped_subcharter = _filter_out_subcharter_rows(normalized_rows)
+    if skipped_subcharter:
+        st.info(
+            "Skipped %d leg%s because the workflow contains 'Subcharter'."
+            % (skipped_subcharter, "s" if skipped_subcharter != 1 else "")
+        )
+    normalization_stats["skipped_subcharter"] = skipped_subcharter
     rows, window_stats = _filter_rows_by_departure_window(
         normalized_rows, window_start_utc, window_end_utc
     )
@@ -509,7 +559,11 @@ def fetch_next_day_legs(
         "departure_window_utc": window_meta,
         "departure_window_counts": window_stats,
     }
+    if skipped_subcharter:
+        metadata["skipped_subcharter_legs"] = skipped_subcharter
     if not normalized_rows:
+        if original_normalized_count and skipped_subcharter == original_normalized_count:
+            return pd.DataFrame(), metadata, crew_summary
         st.warning("FL3XX API returned no recognizable legs for the selected date.")
         return pd.DataFrame(), metadata, crew_summary
     if not rows:
