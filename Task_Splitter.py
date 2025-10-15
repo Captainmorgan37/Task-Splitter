@@ -125,6 +125,17 @@ def _tomorrow_local() -> date:
     return (now_local + timedelta(days=1)).date()
 
 
+def _default_shift_labels(count: int) -> List[str]:
+    presets: Dict[int, List[str]] = {
+        3: ["0500", "0800", "1200"],
+        4: ["0500", "0600", "0700", "1200"],
+        5: ["0500", "0600", "0800", "0900", "1200"],
+    }
+    if count in presets:
+        return list(presets[count])
+    return [f"Shift {i+1}" for i in range(count)]
+
+
 def _compute_departure_window_bounds(target_date: date) -> Tuple[datetime, datetime]:
     start = datetime.combine(target_date, DEPARTURE_WINDOW_START_UTC)
     end_date = target_date + timedelta(days=1)
@@ -940,10 +951,13 @@ assign_mode = st.sidebar.radio(
 
 num_people = st.sidebar.number_input("Number of on-duty people", min_value=1, max_value=12, value=4, step=1)
 
-default_labels = ["Early", "Next 1", "Next 2", "Late"]
+default_labels = _default_shift_labels(int(num_people))
 labels = []
-for i in range(num_people):
-    lbl = st.sidebar.text_input(f"Label for person {i+1}", value=default_labels[i] if i < len(default_labels) else f"Shift {i+1}")
+for i in range(int(num_people)):
+    lbl = st.sidebar.text_input(
+        f"Label for person {i+1}",
+        value=default_labels[i] if i < len(default_labels) else f"Shift {i+1}",
+    )
     labels.append(lbl or f"Shift {i+1}")
 
 # Date selection (default = tomorrow local)
